@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tactical GPS Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #111613;
+      color: #dce5dc;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+    }
+    #map {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      z-index: 1;
+      background: #18201b;
+    }
+    .hud-top {
+      position: fixed;
+      top: 10px;
+      left: 10px;
+      right: 10px;
+      z-index: 1000;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      pointer-events: none;
+    }
+    .panel {
+      pointer-events: auto;
+      background: rgba(15, 20, 17, 0.9);
+      border: 1px solid #35473a;
+      border-radius: 4px;
+      padding: 6px 10px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      backdrop-filter: blur(4px);
+    }
+    button, select, input {
+      background: #1d2720;
+      color: #e4ede4;
+      border: 1px solid #455c4b;
+      border-radius: 3px;
+      padding: 4px 8px;
+      font-family: inherit;
+      font-size: 11px;
+    }
+    button { cursor: pointer; }
+    button:hover { background: #29382e; }
+    button.active {
+      background: #4f772d;
+      border-color: #80b918;
+      color: #fff;
+      font-weight: 700;
+    }
+    .hud-bottom {
+      position: fixed;
+      bottom: 10px;
+      left: 10px;
+      right: 10px;
+      z-index: 1000;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 8px;
+      pointer-events: none;
+    }
+    .status-tag {
+      color: #9bb89e;
+    }
+    .warn {
+      color: #f4a261;
+    }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 2000;
+      background: rgba(0, 0, 0, 0.72);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      width: 100%;
+      max-width: 360px;
+      background: #141b17;
+      border: 1px solid #4c6653;
+      border-radius: 5px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .modal label { display: flex; flex-direction: column; gap: 4px; color: #b7cbb9; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div class="hud-top">
+    <div class="panel">
+      <strong>MODE:</strong>
+      <button id="modePan" class="active">PAN</button>
+      <button id="modeMarker">+ MARKER</button>
+      <button id="modeWp">+ WAYPOINT</button>
+      <button id="clearWp">CLEAR WPs</button>
+      <button id="clearAll">WIPE DATA</button>
+    </div>
+
+    <div class="panel">
+      <strong>LAYER:</strong>
+      <select id="layerSelect">
+        <option value="topo" selected>Topographic</option>
+        <option value="sat">Satellite (ESRI)</option>
+      </select>
+      <button id="gpsBtn">GPS: OFF</button>
+      <button id="centerBtn">CENTER</button>
+    </div>
+
+    <div class="panel">
+      <strong>SEC:</strong>
+      <input id="keyInput" type="password" placeholder="Passphrase (AES-GCM)" style="width:130px;" />
+      <button id="saveKeyBtn">SET KEY</button>
+      <span id="secStatus" class="status-tag">UNENCRYPTED</span>
+    </div>
+  </div>
+
+  <div class="hud-bottom">
+    <div class="panel">
+      <span id="coordsReadout" class="status-tag">LAT: --.----- LON: --.-----</span>
+      <span id="tileStatus" class="status-tag"> | TILES: OK</span>
+    </div>
+    <div class="panel">
+      <span id="wpReadout" class="status-tag">WPs: 0 | DIST: 0.00 km</span>
+    </div>
+  </div>
+
+  <div id="markerModal" class="modal-backdrop">
+    <div class="modal">
+      <strong>NEW TACTICAL MARKER</strong>
+      <label>
+        Label
+        <input id="mLabel" type="text" placeholder="e.g. Objective Alpha" />
+      </label>
+      <label>
+        Side / Color
+        <select id="mSide">
+          <option value="#4ea8de">BLUFOR (Blue)</option>
+          <option value="#e63946">OPFOR (Red)</option>
+          <option value="#52b788">INDEP (Green)</option>
+          <option value="#f4a261">CIV / OBJ (Amber)</option>
+        </select>
+      </label>
+      <label>
+        Notes
+        <input id="mNotes" type="text" placeholder="Optional details" />
+      </label>
+      <div class="modal-actions">
+        <button id="mCancel">CANCEL</button>
+        <button id="mSave" class="active">PLACE</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    (function () {
+      const STORAGE_KEY = "tacmap_state_v1";
+      const state = {
+        mode: "pan", // "pan" | "marker" | "wp"
+        markers: [],
+        waypoints: [],
+        gpsWatchId: null,
+        gpsLatLng: null,
+        gpsMarker: null,
+        pendingLatLng: null,
+        passphrase: ""
+      };
+
+      const memStore = {};
+      function writeStorage(key, val) {
+        try { localStorage.setItem(key, val); } catch (_) { memStore[key] = val; }
+      }
+      function readStorage(key) {
+        try { return localStorage.getItem(key); } catch (_) { return memStore[key] || null; }
+      }
+      function removeStorage(key) {
+        try { localStorage.removeItem(key); } catch (_) { delete memStore[key]; }
+      }
+
+      if (!window.L) {
+        document.getElementById("map").innerHTML =
+          '<div style="padding:24px;color:#f4a261;">Leaflet library could not load. Check your internet connection or host leaflet.js locally.</div>';
+        return;
+      }
+
+      const map = L.map("map", {
+        center: [14.5995, 120.9842],
+        zoom: 13,
+        preferCanvas: true
+      });
+
+      const layers = {
+        topo: L.tileLayer("https://tile.opentopomap.org/{z}/{x}/{y}.png", {
+          maxZoom: 17,
+          attribution: "&copy; OpenTopoMap"
+        }),
+        sat: L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+          maxZoom: 19,
+          attribution: "&copy; Esri"
+        })
+      };
+
+      let activeLayer = layers.topo;
+      activeLayer.addTo(map);
+
+      const tileStatusEl = document.getElementById("tileStatus");
+      let tileErrors = 0;
+      function bindTileEvents(layer) {
+        layer.on("tileerror", () => {
+          tileErrors++;
+          tileStatusEl.textContent = ` | TILES: ${tileErrors} ERR (CHECK NET/SERVER)`;
+          tileStatusEl.className = "warn";
+        });
+        layer.on("load", () => {
+          if (tileErrors === 0) {
+            tileStatusEl.textContent = " | TILES: LOADED";
+            tileStatusEl.className = "status-tag";
+          }
+        });
+      }
+      Object.values(layers).forEach(bindTileEvents);
+
+      setTimeout(() => map.invalidateSize(), 100);
+      window.addEventListener("resize", () => map.invalidateSize());
+
+      const markerLayerGroup = L.layerGroup().addTo(map);
+      const wpLayerGroup = L.layerGroup().addTo(map);
+      let wpPolyline = L.polyline([], { color: "#80b918", weight: 3, dashArray: "6, 6" }).addTo(wpLayerGroup);
+
+      async function deriveKey(passphrase, salt) {
+        const enc = new TextEncoder();
+        const baseKey = await crypto.subtle.importKey(
+          "raw",
+          enc.encode(passphrase),
+          "PBKDF2",
+          false,
+          ["deriveKey"]
+        );
+        return crypto.subtle.deriveKey(
+          { name: "PBKDF2", salt, iterations: 120000, hash: "SHA-256" },
+          baseKey,
+          { name: "AES-GCM", length: 256 },
+          false,
+          ["encrypt", "decrypt"]
+        );
+      }
+
+      async function encryptPayload(obj, passphrase) {
+        const plain = JSON.stringify(obj);
+        if (!passphrase || !window.crypto || !window.crypto.subtle) {
+          return JSON.stringify({ encrypted: false, data: obj });
+        }
+        const salt = crypto.getRandomValues(new Uint8Array(16));
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const key = await deriveKey(passphrase, salt);
+        const ct = await crypto.subtle.encrypt(
+          { name: "AES-GCM", iv },
+          key,
+          new TextEncoder().encode(plain)
+        );
+        const toB64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+        return JSON.stringify({
+          encrypted: true,
+          salt: toB64(salt),
+          iv: toB64(iv),
+          ct: toB64(ct)
+        });
+      }
+
+      async function decryptPayload(raw, passphrase) {
+        const parsed = JSON.parse(raw);
+        if (!parsed.encrypted) return parsed.data || { markers: [], waypoints: [] };
+        if (!passphrase) throw new Error("Passphrase required");
+        const fromB64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+        const key = await deriveKey(passphrase, fromB64(parsed.salt));
+        const pt = await crypto.subtle.decrypt(
+          { name: "AES-GCM", iv: fromB64(parsed.iv) },
+          key,
+          fromB64(parsed.ct)
+        );
+        return JSON.parse(new TextDecoder().decode(pt));
+      }
+
+      async function persistState() {
+        const payload = { markers: state.markers, waypoints: state.waypoints };
+        const serialized = await encryptPayload(payload, state.passphrase);
+        writeStorage(STORAGE_KEY, serialized);
+        const secEl = document.getElementById("secStatus");
+        if (state.passphrase) {
+          secEl.textContent = "AES-256-GCM LOCKED";
+          secEl.className = "status-tag";
+        } else {
+          secEl.textContent = "UNENCRYPTED";
+          secEl.className = "warn";
+        }
+      }
+
+      function renderOverlays() {
+        markerLayerGroup.clearLayers();
+        state.markers.forEach((m, idx) => {
+          const circle = L.circleMarker([m.lat, m.lng], {
+            radius: 7,
+            color: "#0b0e0c",
+            weight: 1.5,
+            fillColor: m.color || "#4ea8de",
+            fillOpacity: 0.95
+          }).addTo(markerLayerGroup);
+
+          const popupDiv = document.createElement("div");
+          const title = document.createElement("strong");
+          title.textContent = m.label || `Marker ${idx + 1}`;
+          popupDiv.appendChild(title);
+          if (m.notes) {
+            popupDiv.appendChild(document.createElement("br"));
+            const noteSpan = document.createElement("span");
+            noteSpan.textContent = m.notes;
+            popupDiv.appendChild(noteSpan);
+          }
+          popupDiv.appendChild(document.createElement("br"));
+          const delBtn = document.createElement("button");
+          delBtn.textContent = "Delete";
+          delBtn.style.marginTop = "6px";
+          delBtn.onclick = () => {
+            state.markers.splice(idx, 1);
+            renderOverlays();
+            persistState();
+          };
+          popupDiv.appendChild(delBtn);
+          circle.bindPopup(popupDiv);
+        });
+
+        wpLayerGroup.clearLayers();
+        wpPolyline = L.polyline(
+          state.waypoints.map((w) => [w.lat, w.lng]),
+          { color: "#80b918", weight: 3, dashArray: "6, 6" }
+        ).addTo(wpLayerGroup);
+
+        let totalMeters = 0;
+        state.waypoints.forEach((w, idx) => {
+          if (idx > 0) {
+            totalMeters += map.distance(
+              [state.waypoints[idx - 1].lat, state.waypoints[idx - 1].lng],
+              [w.lat, w.lng]
+            );
+          }
+          const wpIcon = L.divIcon({
+            className: "",
+            html: `<div style="background:#141b17;color:#aacc00;border:1px solid #80b918;border-radius:3px;padding:1px 5px;font-size:10px;font-weight:700;white-space:nowrap;">WP${idx + 1}</div>`,
+            iconSize: [34, 18],
+            iconAnchor: [17, 9]
+          });
+          L.marker([w.lat, w.lng], { icon: wpIcon }).addTo(wpLayerGroup);
+        });
+
+        document.getElementById("wpReadout").textContent =
+          `WPs: ${state.waypoints.length} | DIST: ${(totalMeters / 1000).toFixed(2)} km`;
+      }
+
+      function setMode(newMode) {
+        state.mode = newMode;
+        ["modePan", "modeMarker", "modeWp"].forEach((id) => {
+          document.getElementById(id).classList.remove("active");
+        });
+        if (newMode === "pan") document.getElementById("modePan").classList.add("active");
+        if (newMode === "marker") document.getElementById("modeMarker").classList.add("active");
+        if (newMode === "wp") document.getElementById("modeWp").classList.add("active");
+      }
+
+      document.getElementById("modePan").onclick = () => setMode("pan");
+      document.getElementById("modeMarker").onclick = () => setMode("marker");
+      document.getElementById("modeWp").onclick = () => setMode("wp");
+
+      document.getElementById("clearWp").onclick = () => {
+        state.waypoints = [];
+        renderOverlays();
+        persistState();
+      };
+
+      document.getElementById("clearAll").onclick = () => {
+        state.markers = [];
+        state.waypoints = [];
+        removeStorage(STORAGE_KEY);
+        renderOverlays();
+      };
+
+      document.getElementById("layerSelect").onchange = (e) => {
+        map.removeLayer(activeLayer);
+        tileErrors = 0;
+        activeLayer = layers[e.target.value];
+        activeLayer.addTo(map);
+      };
+
+      const coordsEl = document.getElementById("coordsReadout");
+      map.on("mousemove", (e) => {
+        coordsEl.textContent = `LAT: ${e.latlng.lat.toFixed(5)} LON: ${e.latlng.lng.toFixed(5)}`;
+      });
+
+      const modal = document.getElementById("markerModal");
+      map.on("click", (e) => {
+        if (state.mode === "marker") {
+          state.pendingLatLng = e.latlng;
+          document.getElementById("mLabel").value = "";
+          document.getElementById("mNotes").value = "";
+          modal.classList.add("open");
+        } else if (state.mode === "wp") {
+          state.waypoints.push({ lat: e.latlng.lat, lng: e.latlng.lng });
+          renderOverlays();
+          persistState();
+        }
+      });
+
+      document.getElementById("mCancel").onclick = () => {
+        state.pendingLatLng = null;
+        modal.classList.remove("open");
+      };
+
+      document.getElementById("mSave").onclick = () => {
+        if (!state.pendingLatLng) return;
+        state.markers.push({
+          lat: state.pendingLatLng.lat,
+          lng: state.pendingLatLng.lng,
+          label: document.getElementById("mLabel").value.trim(),
+          color: document.getElementById("mSide").value,
+          notes: document.getElementById("mNotes").value.trim()
+        });
+        state.pendingLatLng = null;
+        modal.classList.remove("open");
+        renderOverlays();
+        persistState();
+      };
+
+      const gpsBtn = document.getElementById("gpsBtn");
+      gpsBtn.onclick = () => {
+        if (state.gpsWatchId !== null) {
+          navigator.geolocation.clearWatch(state.gpsWatchId);
+          state.gpsWatchId = null;
+          gpsBtn.textContent = "GPS: OFF";
+          gpsBtn.classList.remove("active");
+          return;
+        }
+        if (!navigator.geolocation) {
+          alert("Geolocation is not supported by this browser.");
+          return;
+        }
+        gpsBtn.textContent = "GPS: ACQUIRING...";
+        state.gpsWatchId = navigator.geolocation.watchPosition(
+          (pos) => {
+            const latlng = [pos.coords.latitude, pos.coords.longitude];
+            state.gpsLatLng = latlng;
+            gpsBtn.textContent = "GPS: LIVE";
+            gpsBtn.classList.add("active");
+            if (!state.gpsMarker) {
+              state.gpsMarker = L.circleMarker(latlng, {
+                radius: 8,
+                color: "#ffffff",
+                weight: 2,
+                fillColor: "#00b4d8",
+                fillOpacity: 1
+              }).addTo(map).bindTooltip("YOU");
+              map.setView(latlng, 15);
+            } else {
+              state.gpsMarker.setLatLng(latlng);
+            }
+          },
+          (err) => {
+            gpsBtn.textContent = "GPS: ERR";
+            gpsBtn.classList.remove("active");
+            state.gpsWatchId = null;
+            alert("GPS error: " + err.message + " (Ensure HTTPS or localhost)");
+          },
+          { enableHighAccuracy: true, maximumAge: 2000 }
+        );
+      };
+
+      document.getElementById("centerBtn").onclick = () => {
+        if (state.gpsLatLng) {
+          map.setView(state.gpsLatLng, Math.max(map.getZoom(), 15));
+        } else {
+          map.setView([14.5995, 120.9842], 13);
+        }
+      };
+
+      document.getElementById("saveKeyBtn").onclick = async () => {
+        state.passphrase = document.getElementById("keyInput").value;
+        const raw = readStorage(STORAGE_KEY);
+        if (raw) {
+          try {
+            const loaded = await decryptPayload(raw, state.passphrase);
+            state.markers = loaded.markers || [];
+            state.waypoints = loaded.waypoints || [];
+            renderOverlays();
+          } catch (_) {
+            alert("Could not decrypt existing data with that key.");
+            return;
+          }
+        }
+        await persistState();
+      };
+
+      (async () => {
+        const raw = readStorage(STORAGE_KEY);
+        if (!raw) return;
+        try {
+          const loaded = await decryptPayload(raw, "");
+          state.markers = loaded.markers || [];
+          state.waypoints = loaded.waypoints || [];
+          renderOverlays();
+        } catch (_) {
+          document.getElementById("secStatus").textContent = "ENCRYPTED (ENTER KEY)";
+          document.getElementById("secStatus").className = "warn";
+        }
+      })();
+    })();
+  </script>
+</body>
+</html>
